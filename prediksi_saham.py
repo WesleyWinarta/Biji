@@ -15,7 +15,6 @@ import streamlit as st
 import pickle
 import os
 import traceback
-import msvcrt
 from xgboost import XGBRegressor
 from lightgbm import LGBMRegressor
 from transformers import pipeline  
@@ -1207,4 +1206,5 @@ def main():
         st.info("Silakan masukkan parameter dan klik 'Mulai Prediksi' untuk memulai analisis")
 
 if __name__ == '__main__':
+
     main()
