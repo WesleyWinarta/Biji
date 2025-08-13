@@ -15,7 +15,6 @@ import streamlit as st
 import pickle
 import os
 import traceback
-import msvcrt
 from xgboost import XGBRegressor
 from lightgbm import LGBMRegressor
 from transformers import pipeline  
@@ -1342,3 +1341,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
