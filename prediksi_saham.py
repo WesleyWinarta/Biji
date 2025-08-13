@@ -15,6 +15,7 @@ import streamlit as st
 import pickle
 import os
 import traceback
+import msvcrt
 from xgboost import XGBRegressor
 from lightgbm import LGBMRegressor
 from transformers import pipeline  
@@ -22,10 +23,46 @@ import requests
 import nltk
 from nltk.sentiment import SentimentIntensityAnalyzer
 from dateutil.parser import parse
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
 try:
     nltk.data.find('vader_lexicon')
 except:
     nltk.download('vader_lexicon')
+
+# PyTorch LSTM Model
+class LSTMModel(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, output_size):
+        super(LSTMModel, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+        self.dropout = nn.Dropout(0.2)
+        self.fc = nn.Linear(hidden_size, output_size)
+        
+    def forward(self, x):
+        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
+        c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
+        
+        out, _ = self.lstm(x, (h0, c0))
+        out = self.dropout(out[:, -1, :])
+        out = self.fc(out)
+        return out
+
+# PyTorch Dataset
+class StockDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = torch.FloatTensor(X)
+        self.y = torch.FloatTensor(y)
+        
+    def __len__(self):
+        return len(self.X)
+    
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
 
 class SafeMinMaxScaler(MinMaxScaler):
     """MinMaxScaler with safety checks for division by zero"""
@@ -133,12 +170,13 @@ def load_data(source, ticker, start_date, end_date):
         st.error(f"Error loading data: {str(e)}")
         st.error(traceback.format_exc())
         return None
+
 def fetch_news(ticker, days=30):
     """Fetch news with robust error handling and API validation"""
     NEWS_API_KEY = "7ea7f763089f40c894d041886756deef"  # Replace with your actual key
     if not NEWS_API_KEY:
         st.warning("NewsAPI key not configured")
-        return pd.DataFrame(columns=['date', 'title', 'description', 'source'])
+        return pd.DataFrame(columns=['date', 'title', 'description', 'source', 'url'])
     
     try:
         url = f"https://newsapi.org/v2/everything?q={ticker}&language=en&sortBy=publishedAt&apiKey={NEWS_API_KEY}"
@@ -161,7 +199,8 @@ def fetch_news(ticker, days=30):
                     'date': pd.to_datetime(article.get('publishedAt', '')).date(),
                     'title': article.get('title', ''),
                     'description': article.get('description', ''),
-                    'source': article.get('source', {}).get('name', '')
+                    'source': article.get('source', {}).get('name', ''),
+                    'url': article.get('url', '')  # Tambahkan URL berita
                 })
             except:
                 continue
@@ -174,6 +213,7 @@ def fetch_news(ticker, days=30):
     except Exception as e:
         st.error(f"Failed to fetch news: {str(e)}")
         return pd.DataFrame()
+
 def analyze_sentiment(news_df):
     """Analyze sentiment with robust error handling"""
     if news_df.empty or ('description' not in news_df.columns):
@@ -218,7 +258,7 @@ def add_news_features(data, ticker, window=30):
                 data.loc[date, 'News_Sentiment'] = sentiment
     
     return data
-# Fungsi untuk memproses data
+
 def preprocess_data(data, look_back=60, use_multi_feature=False, use_news=False):
     try:
         if len(data) <= look_back:
@@ -285,7 +325,7 @@ def preprocess_data(data, look_back=60, use_multi_feature=False, use_news=False)
         st.error(f"Error in preprocessing: {str(e)}")
         st.write("Error traceback:", traceback.format_exc())
         return None, None, None, None
-# Fungsi untuk membangun model LSTM
+
 def build_lstm_model(input_shape, use_multi_feature=False):
     model = Sequential()
     if use_multi_feature:
@@ -301,72 +341,118 @@ def build_lstm_model(input_shape, use_multi_feature=False):
     model.compile(optimizer='adam', loss='mean_squared_error')
     return model
 
-# Fungsi untuk melatih semua model
+def train_pytorch_model(X_train, y_train, input_size, epochs=20, batch_size=32):
+    """Train PyTorch LSTM model"""
+    # Determine input size
+    if len(X_train.shape) == 3:
+        input_size = X_train.shape[2]
+    else:
+        input_size = 1
+    
+    # Create model
+    model = LSTMModel(input_size=input_size, 
+                     hidden_size=50, 
+                     num_layers=3, 
+                     output_size=1)
+    
+    # Loss and optimizer
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    
+    # Create dataset and dataloader
+    dataset = StockDataset(X_train, y_train)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    
+    # Training loop
+    model.train()
+    for epoch in range(epochs):
+        for batch_X, batch_y in dataloader:
+            # Forward pass
+            outputs = model(batch_X)
+            loss = criterion(outputs, batch_y.unsqueeze(1))
+            
+            # Backward pass and optimize
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+    
+    return model
+
 def train_models(X_train, y_train, lstm_input_shape, use_multi_feature=False, selected_models=None):
     models = {}
     
-    # Persiapan data untuk model non-LSTM
+    # Prepare data for non-LSTM models
     if use_multi_feature:
         X_train_flat = X_train.reshape(X_train.shape[0], -1)
     else:
         X_train_flat = X_train.reshape(X_train.shape[0], -1)
     
-    # Latih model yang dipilih
+    # Train selected models
     if 'LSTM' in selected_models:
-        with st.spinner('Melatih model LSTM...'):
+        with st.spinner('Training LSTM model...'):
             lstm_model = build_lstm_model(lstm_input_shape, use_multi_feature)
             lstm_model.fit(X_train, y_train, epochs=20, batch_size=32, verbose=0)
             models['LSTM'] = lstm_model
-            st.success('LSTM selesai dilatih')
+            st.success('LSTM training completed')
+    
+    if 'PyTorch LSTM' in selected_models:
+        with st.spinner('Training PyTorch LSTM model...'):
+            if use_multi_feature:
+                input_size = X_train.shape[2]
+            else:
+                input_size = 1
+            pt_model = train_pytorch_model(X_train, y_train, input_size)
+            models['PyTorch LSTM'] = pt_model
+            st.success('PyTorch LSTM training completed')
     
     if 'Random Forest' in selected_models:
-        with st.spinner('Melatih model Random Forest...'):
+        with st.spinner('Training Random Forest model...'):
             rf_model = RandomForestRegressor(n_estimators=100, random_state=42)
             rf_model.fit(X_train_flat, y_train)
             models['Random Forest'] = rf_model
-            st.success('Random Forest selesai dilatih')
+            st.success('Random Forest training completed')
     
     if 'XGBoost' in selected_models:
-        with st.spinner('Melatih model XGBoost...'):
+        with st.spinner('Training XGBoost model...'):
             xgb_model = XGBRegressor(n_estimators=100, random_state=42)
             xgb_model.fit(X_train_flat, y_train)
             models['XGBoost'] = xgb_model
-            st.success('XGBoost selesai dilatih')
+            st.success('XGBoost training completed')
     
     if 'LightGBM' in selected_models:
-        with st.spinner('Melatih model LightGBM...'):
+        with st.spinner('Training LightGBM model...'):
             lgbm_model = LGBMRegressor(n_estimators=100, random_state=42)
             lgbm_model.fit(X_train_flat, y_train)
             models['LightGBM'] = lgbm_model
-            st.success('LightGBM selesai dilatih')
+            st.success('LightGBM training completed')
     
     if 'SVR' in selected_models:
-        with st.spinner('Melatih model SVR...'):
+        with st.spinner('Training SVR model...'):
             svr_model = SVR()
             svr_model.fit(X_train_flat, y_train)
             models['SVR'] = svr_model
-            st.success('SVR selesai dilatih')
+            st.success('SVR training completed')
     
     if 'MLP' in selected_models:
-        with st.spinner('Melatih model MLP...'):
+        with st.spinner('Training MLP model...'):
             mlp_model = MLPRegressor(hidden_layer_sizes=(100, 50), max_iter=1000, random_state=42)
             mlp_model.fit(X_train_flat, y_train)
             models['MLP'] = mlp_model
-            st.success('MLP selesai dilatih')
+            st.success('MLP training completed')
     
     if 'Linear Regression' in selected_models:
-        with st.spinner('Melatih model Linear Regression...'):
+        with st.spinner('Training Linear Regression model...'):
             lr_model = LinearRegression()
             lr_model.fit(X_train_flat, y_train)
             models['Linear Regression'] = lr_model
-            st.success('Linear Regression selesai dilatih')
+            st.success('Linear Regression training completed')
     
     if 'Gradient Boosting' in selected_models:
-        with st.spinner('Melatih model Gradient Boosting...'):
+        with st.spinner('Training Gradient Boosting model...'):
             gb_model = GradientBoostingRegressor(n_estimators=100, random_state=42)
             gb_model.fit(X_train_flat, y_train)
             models['Gradient Boosting'] = gb_model
-            st.success('Gradient Boosting selesai dilatih')
+            st.success('Gradient Boosting training completed')
     
     return models
 
@@ -384,8 +470,14 @@ def ensemble_predict(models, X_input, y_actual, scaler, use_multi_feature=False)
     # First pass: get all individual predictions and calculate RMSEs
     for model_name, model in models.items():
         try:
-            if model_name == 'LSTM':
-                pred = model.predict(X_input, verbose=0)
+            if model_name in ['LSTM', 'PyTorch LSTM']:
+                if model_name == 'LSTM':
+                    pred = model.predict(X_input, verbose=0)
+                else:  # PyTorch LSTM
+                    with torch.no_grad():
+                        model.eval()
+                        X_tensor = torch.FloatTensor(X_input)
+                        pred = model(X_tensor).numpy()
             else:
                 if use_multi_feature:
                     X_input_flat = X_input.reshape(X_input.shape[0], -1)
@@ -410,7 +502,7 @@ def ensemble_predict(models, X_input, y_actual, scaler, use_multi_feature=False)
             models_rmse[model_name] = rmse
             
         except Exception as e:
-            st.warning(f"Prediksi {model_name} dilewati karena error: {str(e)}")
+            st.warning(f"Prediction skipped for {model_name} due to error: {str(e)}")
             continue
     
     # Create ensemble predictions only if we have multiple successful models
@@ -461,13 +553,19 @@ def predict_future(models, last_data, scaler, look_back, days_to_predict, use_mu
         
         for model_name, model in models.items():
             try:
-                if model_name == 'LSTM':
+                if model_name in ['LSTM', 'PyTorch LSTM']:
                     if use_multi_feature:
                         current_batch_lstm = current_batch.reshape(1, look_back, n_features)
                     else:
                         current_batch_lstm = current_batch.reshape(1, look_back, 1)
                     
-                    pred = model.predict(current_batch_lstm, verbose=0)
+                    if model_name == 'LSTM':
+                        pred = model.predict(current_batch_lstm, verbose=0)
+                    else:  # PyTorch LSTM
+                        with torch.no_grad():
+                            model.eval()
+                            X_tensor = torch.FloatTensor(current_batch_lstm)
+                            pred = model(X_tensor).numpy()
                 else:
                     if use_multi_feature:
                         current_batch_flat = current_batch.reshape(1, -1)
@@ -479,7 +577,7 @@ def predict_future(models, last_data, scaler, look_back, days_to_predict, use_mu
                 # Inverse transform
                 if use_multi_feature:
                     dummy = np.zeros((1, n_features))
-                    dummy[:, -1] = pred[0, 0] if model_name == 'LSTM' else pred[0]
+                    dummy[:, -1] = pred[0, 0] if model_name in ['LSTM', 'PyTorch LSTM'] else pred[0]
                     pred_value = scaler.inverse_transform(dummy)[0, -1]
                 else:
                     pred_value = scaler.inverse_transform(pred.reshape(1, -1))[0][0]
@@ -487,17 +585,17 @@ def predict_future(models, last_data, scaler, look_back, days_to_predict, use_mu
                 future_predictions[model_name].append(pred_value)
                 day_preds[model_name] = pred_value
                 
-                # Update LSTM batch for next prediction
-                if model_name == 'LSTM':
+                # Update batch for next prediction
+                if model_name in ['LSTM', 'PyTorch LSTM']:
                     if use_multi_feature:
                         new_features = np.zeros((1, 1, n_features))
-                        new_features[:, :, -1] = pred[0, 0]
+                        new_features[:, :, -1] = pred[0, 0] if model_name == 'LSTM' else pred[0]
                         current_batch = np.append(current_batch[:, 1:, :], new_features, axis=1)
                     else:
                         current_batch = np.append(current_batch[:, 1:, :], pred.reshape(1, 1, 1), axis=1)
             
             except Exception as e:
-                st.warning(f"Prediksi {model_name} hari {day+1} dilewati: {str(e)}")
+                st.warning(f"Prediction skipped for {model_name} day {day+1}: {str(e)}")
                 future_predictions[model_name].append(np.nan)
         
         daily_predictions.append(day_preds)
@@ -528,6 +626,7 @@ def predict_future(models, last_data, scaler, look_back, days_to_predict, use_mu
                 future_predictions['Median_Ensemble'].append(np.median(valid_preds))
     
     return future_predictions
+
 def show_extreme_detail_guide():
     st.markdown("""
     # 🧠📈 PANDUAN SUPER DETAIL APLIKASI PREDIKSI SAHAM (v2.0)
@@ -552,7 +651,9 @@ def show_extreme_detail_guide():
        - Handling missing data (interpolasi linear)
        - Feature engineering (auto-detect)
     3. **Model Layer**:
-       - 8 model terpisah
+       - TensorFlow/Keras LSTM
+       - PyTorch LSTM
+       - 6 model machine learning klasik
        - 3 ensemble method
     4. **Visualization**:
        - Interactive Plotly charts
@@ -591,7 +692,7 @@ def show_extreme_detail_guide():
       - `MM-DD-YYYY HH:MM`
 
     ## 🤖 **3. MODEL DETAIL (LEVEL KODE)**
-    ### LSTM Architecture:
+    ### LSTM Architecture (TensorFlow/Keras):
     ```python
     Sequential(
         LSTM(units=50, return_sequences=True),
@@ -606,6 +707,25 @@ def show_extreme_detail_guide():
     - **Optimizer**: Adam (lr=0.001)
     - **Batch Size**: 32
     - **Epochs**: 20 (early stopping)
+
+    ### PyTorch LSTM Architecture:
+    ```python
+    class LSTMModel(nn.Module):
+        def __init__(self, input_size, hidden_size, num_layers, output_size):
+            super().__init__()
+            self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+            self.dropout = nn.Dropout(0.2)
+            self.fc = nn.Linear(hidden_size, output_size)
+        
+        def forward(self, x):
+            out, _ = self.lstm(x)
+            out = self.dropout(out[:, -1, :])
+            out = self.fc(out)
+            return out
+    ```
+    - **Optimizer**: Adam (lr=0.001)
+    - **Batch Size**: 32
+    - **Epochs**: 20
 
     ### Hyperparameter Model Lain:
     | Model | Parameter Kunci | Default Value | Range Optimal |
@@ -683,14 +803,14 @@ def show_extreme_detail_guide():
     3. Shape training set
     4. Model summary
 
-    ## 🧪 **7. USE CASE STUDIES**
+    ## � **7. USE CASE STUDIES**
     ### Case 1: Day Trading Crypto
     **Konfigurasi**:
     ```yaml
     ticker: BTC-USD
     timeframe: 1h
     lookback: 168 (7 hari hourly)
-    models: [LSTM, LightGBM]
+    models: [LSTM, PyTorch LSTM, LightGBM]
     features: [close, volume]
     ```
     **Hasil Optimal**:
@@ -716,6 +836,7 @@ def show_extreme_detail_guide():
 
     **Library Versi**:
     - TensorFlow 2.10+
+    - PyTorch 1.12+
     - scikit-learn 1.2+
     - yfinance 0.2+
 
@@ -731,11 +852,12 @@ def show_extreme_detail_guide():
     ```python
     custom_weights = {
         'LSTM': 0.4,
-        'XGBoost': 0.3,
-        'RF': 0.3
+        'PyTorch LSTM': 0.3,
+        'XGBoost': 0.3
     }
     ```
     """)
+
 def generate_recommendation(prediction_df, current_price, risk_tolerance='medium'):
     """
     Menghasilkan rekomendasi tindakan berdasarkan prediksi harga saham
@@ -835,11 +957,10 @@ def display_recommendation(recommendation):
     """, unsafe_allow_html=True)
     
     # Tambahkan disclaimer
-    st.caption("⚠️ Catatan: Rekomendasi ini berdasarkan analisis algoritmik dan tidak menjamin keakuratan. Selalu lakukan riset tambahan sebelum mengambil keputasan investasi.")
+    st.caption("⚠️ Catatan: Rekomendasi ini berdasarkan analisis algoritmik dan tidak menjamin keakuratan. Selalu lakukan riset tambahan.")
 
-# Fungsi utama Streamlit
 def main():
-    st.title('📊 Stock Prediction ')
+    st.title('📊 Stock Prediction with TensorFlow & PyTorch')
     
     # Tampilkan panduan lengkap
     with st.expander("📘 BUKU PANDUAN LENGKAP (Klik untuk Membuka)", expanded=False):
@@ -862,14 +983,14 @@ def main():
     use_multi_feature = st.sidebar.checkbox("Gunakan Fitur Tambahan (Open, High, Low, Volume, Change)", False)
     use_news = st.sidebar.checkbox("Gunakan Analisis Sentimen Berita (Hanya Live Data)", True)
     
-    # Daftar model yang tersedia
-    available_models = ['LSTM', 'Random Forest', 'XGBoost', 'LightGBM', 
+    # Daftar model yang tersedia (termasuk PyTorch LSTM)
+    available_models = ['LSTM', 'PyTorch LSTM', 'Random Forest', 'XGBoost', 'LightGBM', 
                       'SVR', 'MLP', 'Linear Regression', 'Gradient Boosting']
     
     selected_models = st.sidebar.multiselect(
         "Select Models",
         available_models,
-        default=['LSTM', 'Random Forest'],
+        default=['LSTM', 'PyTorch LSTM', 'Random Forest'],
         help="Select at least one model"
     )
     
@@ -1160,7 +1281,21 @@ def main():
                     news_df = fetch_news(ticker)
                     if not news_df.empty:
                         st.subheader("Berita Terbaru")
-                        st.dataframe(news_df.head(10))
+    
+                     # Buat kolom tambahan dengan link
+                    news_df['link'] = news_df['url'].apply(
+                     lambda x: f'<a href="{x}" target="_blank">Baca Selengkapnya</a>' if x else 'No link available'
+                     )
+    
+                    # Tampilkan dengan format HTML
+                    st.write(
+                     news_df[['date', 'title', 'source', 'link']].to_html(
+                      escape=False, 
+                     index=False,
+                         render_links=True
+                     ), 
+                    unsafe_allow_html=True
+                    )
                 
                 # Bagian Rekomendasi
                 try:
@@ -1206,5 +1341,4 @@ def main():
         st.info("Silakan masukkan parameter dan klik 'Mulai Prediksi' untuk memulai analisis")
 
 if __name__ == '__main__':
-
     main()
