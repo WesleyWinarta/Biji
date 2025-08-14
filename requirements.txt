@@ -11,4 +11,3 @@ ta>=0.10.0
 lightgbm>=3.3.0
 xgboost>=1.6.0
 catboost>=1.0.0
-transformers>=4.40.0
