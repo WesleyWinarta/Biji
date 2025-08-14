@@ -17,7 +17,6 @@ import os
 import traceback
 from xgboost import XGBRegressor
 from lightgbm import LGBMRegressor
-from transformers import pipeline  
 import requests  
 import nltk
 from nltk.sentiment import SentimentIntensityAnalyzer
@@ -1341,4 +1340,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 
